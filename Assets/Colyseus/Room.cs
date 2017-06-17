@@ -1,142 +1,293 @@
 ﻿using System;
-
-using MsgPack;
-using MsgPack.Serialization;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using Marvin.JsonPatch;
+using Marvin.JsonPatch.Operations;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 
 namespace Colyseus
 {
-	/// <summary>
-	/// </summary>
-	public class Room
-	{
-		private Client client;
+	using PatchListener = Listener<Action<string[], object>>;
+	using FallbackPatchListener = Listener<Action<string, string, object>>;
 
-		/// <summary>
-		/// Name of the <see cref="Room"/>.
-		/// </summary>
+	public struct Listener<T>
+	{
+		public T callback;
+		public string operation;
+		public Regex[] rules;
+	}
+
+	public abstract class BaseRoom
+	{
+		protected Client client;
+
 		public String name;
 
-		public DeltaContainer state = new DeltaContainer(new MessagePackObject(new MessagePackObjectDictionary()));
-		//public MessagePackObject state;
+		protected long _id = 0;
 
-		private int _id = 0;
-		private byte[] _previousState = null;
 
-		/// <summary>
-		/// Occurs when the <see cref="Client"/> successfully connects to the <see cref="Room"/>.
-		/// </summary>
 		public event EventHandler OnJoin;
-
-		/// <summary>
-		/// Occurs when some error has been triggered in the room.
-		/// </summary>
+		public event EventHandler OnLeave;
 		public event EventHandler OnError;
 
-		/// <summary>
-		/// Occurs when <see cref="Client"/> leaves this room.
-		/// </summary>
-		public event EventHandler OnLeave;
-
-		/// <summary>
-		/// Occurs when server send patched state, before <see cref="OnUpdate"/>.
-		/// </summary>
 		public event EventHandler<MessageEventArgs> OnPatch;
-
-		/// <summary>
-		/// Occurs when server sends a message to this <see cref="Room"/>
-		/// </summary>
 		public event EventHandler<MessageEventArgs> OnData;
 
-		/// <summary>
-		/// Occurs after applying the patched state on this <see cref="Room"/>.
-		/// </summary>
-		public event EventHandler<RoomUpdateEventArgs> OnUpdate;
 
-		/// <summary>
-		/// Initializes a new instance of the <see cref="Room"/> class.
-		/// It synchronizes state automatically with the server and send and receive messaes.
-		/// </summary>
-		/// <param name="client">
-		/// The <see cref="Client"/> client connection instance.
-		/// </param>
-		/// <param name="name">The name of the room</param>
-		public Room (Client client, String name)
+
+		public BaseRoom(Client client, String name)
 		{
 			this.client = client;
 			this.name = name;
 		}
 
-		/// <summary>
-		/// Contains the id of this room, used internally for communication.
-		/// </summary>
-		public int id
+		public long id
 		{
 			get { return this._id; }
-			set {
+			set
+			{
 				this._id = value;
 				this.OnJoin.Invoke(this, EventArgs.Empty);
-      }
-    }
+			}
+		}
 
 
-		public void SetState( MessagePackObject state, int remoteCurrentTime, int remoteElapsedTime)
+		public void Leave(bool requestLeave = true)
 		{
-			this.state.Set(state);
+			if (requestLeave && this._id > 0)
+			{
+				this.Send(new object[] { Protocol.LEAVE_ROOM, this._id });
+			}
+			else
+			{
+				this.OnLeave.Invoke(this, EventArgs.Empty);
+			}
+		}
+
+		public void Send(object data)
+		{
+			this.client.Send(new object[] { Protocol.ROOM_DATA, this._id, data });
+		}
+
+
+		public void EmitError(MessageEventArgs args)
+		{
+			this.OnError.Invoke(this, args);
+		}
+
+		public void ReceiveData(object data)
+		{
+			if (this.OnData != null)
+				this.OnData.Invoke(this, new MessageEventArgs(this, data));
+		}
+
+		public abstract void SetState(JObject state, double remoteCurrentTime, long remoteElapsedTime);
+		public abstract void ApplyPatch(string patch);
+	};
+
+
+	public class Room<T> : BaseRoom where T : class
+	{
+		// public DeltaContainer state = new DeltaContainer(new RoomState());
+		//public IndexedDictionary<string, object> state;
+		public T state;
+		private T _previousState;
+
+
+		public Room(Client client, string name) : base(client, name)
+		{
+			Reset();
+		}
+
+		public event EventHandler<RoomUpdateEventArgs<T>> OnUpdate;
+
+		public override void SetState(JObject state, double remoteCurrentTime, long remoteElapsedTime)
+		{
+			T st = state.ToObject<T>();
+			SetState(st, remoteCurrentTime, remoteElapsedTime);
+		}
+
+		public void SetState(T state, double remoteCurrentTime, long remoteElapsedTime)
+		{
+			this.state = state;
 
 			// TODO:
 			// Create a "clock" for remoteCurrentTime / remoteElapsedTime to match the JavaScript API.
 
 			// Creates serializer.
-			var serializer = MessagePackSerializer.Get <MessagePackObject>();
-			this.OnUpdate.Invoke(this, new RoomUpdateEventArgs(this, state, null));
-			this._previousState = serializer.PackSingleObject (state);
+			if (this.OnUpdate != null)
+				this.OnUpdate.Invoke(this, new RoomUpdateEventArgs<T>(this, state, null));
 		}
 
-		/// <summary>
-		/// Leave the room.
-		/// </summary>
-		public void Leave (bool requestLeave = true)
+		/// <summary>Internal usage, shouldn't be called.</summary>
+		public override void ApplyPatch(string patch)
 		{
-			if (requestLeave && this._id > 0) {
-				this.Send (new object[]{ Protocol.LEAVE_ROOM, this._id });
-			} else {
-				this.OnLeave.Invoke(this, EventArgs.Empty);
+			var patches = JsonConvert.DeserializeObject<JsonPatchDocument<T>>(patch);
+			patches.ApplyTo(state);
+
+			CheckPatches(patches);
+
+			//this.state = state
+			if (this.OnUpdate != null)
+				this.OnUpdate.Invoke(this, new RoomUpdateEventArgs<T>(this, this.state, null));
+		}
+
+
+
+		private Dictionary<string, List<PatchListener>> listeners;
+		private List<FallbackPatchListener> fallbackListeners;
+
+		private Dictionary<string, Regex> matcherPlaceholders = new Dictionary<string, Regex>()
+		{
+			{":id", new Regex(@"^([a-zA-Z0-9\-_]+)$")},
+			{":number", new Regex(@"^([0-9]+)$")},
+			{":string", new Regex(@"^(\w+)$")},
+			{":axis", new Regex(@"^([xyz])$")},
+			{"*", new Regex(@"(.*)")},
+		};
+
+		public FallbackPatchListener Listen(Action<string, string, object> callback)
+		{
+			FallbackPatchListener listener = new FallbackPatchListener
+			{
+				callback = callback,
+				operation = "",
+				rules = new Regex[] { }
+			};
+
+			this.fallbackListeners.Add(listener);
+
+			return listener;
+		}
+
+		public PatchListener Listen(string segments, string operation, Action<string[], object> callback)
+		{
+			var regexpRules = this.ParseRegexRules(segments.Split('/'));
+
+			PatchListener listener = new PatchListener
+			{
+				callback = callback,
+				operation = operation,
+				rules = regexpRules
+			};
+
+			this.listeners[operation].Add(listener);
+
+			return listener;
+		}
+
+		public void RemoveListener(PatchListener listener)
+		{
+			for (var i = this.listeners[listener.operation].Count - 1; i >= 0; i--)
+			{
+				if (this.listeners[listener.operation][i].Equals(listener))
+				{
+					this.listeners[listener.operation].RemoveAt(i);
+				}
 			}
 		}
 
-		/// <summary>
-		/// Send data to this room.
-		/// </summary>
-		/// <param name="data">Data to be sent</param>
-		public void Send (object data)
+		public void RemoveAllListeners()
 		{
-			this.client.Send(new object[]{Protocol.ROOM_DATA, this._id, data});
+			this.Reset();
 		}
 
-		/// <summary>Internal usage, shouldn't be called.</summary>
-		public void ReceiveData (object data)
+		private void Reset()
 		{
-			this.OnData.Invoke(this, new MessageEventArgs(this, data));
-    }
-
-		/// <summary>Internal usage, shouldn't be called.</summary>
-		public void ApplyPatch (byte[] delta)
-		{
-			this._previousState = Fossil.Delta.Apply (this._previousState, delta);
-
-			var serializer = MessagePackSerializer.Get <MessagePackObject>();
-			var newState = serializer.UnpackSingleObject (this._previousState);
-
-			this.state.Set(newState);
-			//this.state = state
-			this.OnUpdate.Invoke(this, new RoomUpdateEventArgs(this, this.state.data, null));
+			this.listeners = new Dictionary<string, List<PatchListener>>()
+			{
+				{"add", new List<PatchListener>()},
+				{"remove", new List<PatchListener>()},
+				{"replace", new List<PatchListener>()}
+			};
+			this.fallbackListeners = new List<FallbackPatchListener>();
 		}
 
-		/// <summary>Internal usage, shouldn't be called.</summary>
-		public void EmitError (MessageEventArgs args)
+		protected Regex[] ParseRegexRules(string[] rules)
 		{
-			this.OnError.Invoke(this, args);
+			Regex[] regexpRules = new Regex[rules.Length];
+
+			for (int i = 0; i < rules.Length; i++)
+			{
+				var segment = rules[i];
+				if (segment.IndexOf(':') == 0)
+				{
+					if (this.matcherPlaceholders.ContainsKey(segment))
+					{
+						regexpRules[i] = this.matcherPlaceholders[segment];
+					}
+					else
+					{
+						regexpRules[i] = this.matcherPlaceholders["*"];
+					}
+				}
+				else
+				{
+					regexpRules[i] = new Regex(segment);
+				}
+			}
+
+			return regexpRules;
+		}
+
+		public void RegisterPlaceholder(string placeholder, Regex matcher)
+		{
+			this.matcherPlaceholders[placeholder] = matcher;
+		}
+
+
+		private void CheckPatches(JsonPatchDocument<T> patches)
+		{
+			var matched = false;
+
+			foreach (var operation in patches.Operations)
+			{
+				foreach (var listener in listeners[operation.op])
+				{
+					var matches = this.CheckPatch(operation, listener);
+					if (matches.Length > 0)
+					{
+						listener.callback.Invoke(matches, operation.value);
+						matched = true;
+					}
+				}
+
+				// check for fallback listener
+				if (!matched && fallbackListeners.Count > 0)
+				{
+					foreach (var listener in fallbackListeners)
+					{
+						listener.callback.Invoke(operation.path, operation.op, operation.value);
+					}
+				}
+			}
+		}
+
+		private string[] CheckPatch(Operation patch, PatchListener listener)
+		{
+			// skip if rules count differ from patch
+			// if (patch.path.Length != listener.rules.Length)
+			// {
+			//     return new string[] { };
+			// }
+
+			List<string> pathVars = new List<string>();
+
+			for (var i = 0; i < listener.rules.Length; i++)
+			{
+				var matches = listener.rules[i].Matches(patch.path);
+				if (matches.Count == 0 || matches.Count > 2)
+				{
+					return new string[] { };
+				}
+				pathVars.Add(matches[0].ToString());
+				// pathVars = pathVars.concat(matches.slice(1));
+			}
+
+			return pathVars.ToArray();
 		}
 	}
 }

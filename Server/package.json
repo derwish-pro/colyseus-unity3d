@@ -1,21 +1,22 @@
 {
-  "name": "colyseus-unity3d",
-  "private": true,
-  "repository": {
-    "type": "git",
-    "url": "git://github.com/gamestdio/colyseus-unity3d.git"
-  },
+  "name": "colyseus-examples",
+  "version": "1.0.0",
+  "description": "Usage Examples of Colyseus Game Server",
+  "main": "index.js",
   "scripts": {
-    "start": "nodemon --harmony ./index.js"
+    "start": "tsc && node index.js"
   },
-  "engines": {
-    "node": ">= 5.x"
-  },
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "colyseus": "^0.4.15",
-    "express": "^4.13.3"
+    "@types/fast-json-patch": "^1.1.5",
+    "colyseus": "^0.4.4",
+    "colyseus.js": "^0.6.0-alpha.1",
+    "express": "^4.14.0",
+    "fast-json-patch": "^1.2.2",
+    "serve-index": "^1.8.0"
   },
   "devDependencies": {
-    "nodemon": "^1.7.1"
+    "typescript": "^2.1.4"
   }
 }
